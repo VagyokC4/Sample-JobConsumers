@@ -1,12 +1,15 @@
+using System;
 using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using JobService.Components;
 using MassTransit;
+using MassTransit.Azure.ServiceBus.Core.Topology;
 using MassTransit.Conductor;
 using MassTransit.Definition;
 using MassTransit.EntityFrameworkCoreIntegration;
 using MassTransit.EntityFrameworkCoreIntegration.JobService;
+using MassTransit.JobService;
 using MassTransit.JobService.Components.StateMachines;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
@@ -17,6 +20,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -35,37 +39,41 @@ namespace JobService.Service
         {
             services.AddControllers();
 
-            services.AddDbContext<JobServiceSagaDbContext>(builder =>
-                builder.UseNpgsql(Configuration.GetConnectionString("JobService"), m =>
-                {
-                    m.MigrationsAssembly(Assembly.GetExecutingAssembly().GetName().Name);
-                    m.MigrationsHistoryTable($"__{nameof(JobServiceSagaDbContext)}");
-                }));
+            // services.AddDbContext<JobServiceSagaDbContext>(builder =>
+            // builder.UseNpgsql(Configuration.GetConnectionString("JobService"), m =>
+            // {
+            // m.MigrationsAssembly(Assembly.GetExecutingAssembly().GetName().Name);
+            // m.MigrationsHistoryTable($"__{nameof(JobServiceSagaDbContext)}");
+            // }));
 
             services.AddMassTransit(x =>
             {
-                x.AddRabbitMqMessageScheduler();
-
+                x.AddServiceBusMessageScheduler();
+                //x.AddRabbitMqMessageScheduler();
+                
                 x.AddConsumer<ConvertVideoJobConsumer>(typeof(ConvertVideoJobConsumerDefinition));
 
                 x.AddSagaRepository<JobSaga>()
-                    .EntityFrameworkRepository(r =>
-                    {
-                        r.ExistingDbContext<JobServiceSagaDbContext>();
-                        r.LockStatementProvider = new PostgresLockStatementProvider();
-                    });
+                    .MessageSessionRepository();
+                // .EntityFrameworkRepository(r =>
+                // {
+                // r.ExistingDbContext<JobServiceSagaDbContext>();
+                // r.LockStatementProvider = new PostgresLockStatementProvider();
+                // });
                 x.AddSagaRepository<JobTypeSaga>()
-                    .EntityFrameworkRepository(r =>
-                    {
-                        r.ExistingDbContext<JobServiceSagaDbContext>();
-                        r.LockStatementProvider = new PostgresLockStatementProvider();
-                    });
+                    .MessageSessionRepository();
+                // .EntityFrameworkRepository(r =>
+                // {
+                // r.ExistingDbContext<JobServiceSagaDbContext>();
+                // r.LockStatementProvider = new PostgresLockStatementProvider();
+                // });
                 x.AddSagaRepository<JobAttemptSaga>()
-                    .EntityFrameworkRepository(r =>
-                    {
-                        r.ExistingDbContext<JobServiceSagaDbContext>();
-                        r.LockStatementProvider = new PostgresLockStatementProvider();
-                    });
+                    .MessageSessionRepository();
+                // .EntityFrameworkRepository(r =>
+                // {
+                // r.ExistingDbContext<JobServiceSagaDbContext>();
+                // r.LockStatementProvider = new PostgresLockStatementProvider();
+                // });
 
                 x.AddServiceClient();
 
@@ -73,9 +81,18 @@ namespace JobService.Service
 
                 x.SetKebabCaseEndpointNameFormatter();
 
-                x.UsingRabbitMq((context, cfg) =>
+                x.UsingAzureServiceBus((context, cfg) =>
+                    // x.UsingRabbitMq((context, cfg) =>
                 {
-                    cfg.UseRabbitMqMessageScheduler();
+                    var azureServiceBusCredential = "";
+                    cfg.Host(azureServiceBusCredential);
+
+                    // Sessions
+                    cfg.RequiresSession = true;
+                    cfg.Send<ConvertVideo>(ConfigureSessionIdFormatter);
+
+                    cfg.UseServiceBusMessageScheduler();
+                    // cfg.UseRabbitMqMessageScheduler();
 
                     var options = new ServiceInstanceOptions()
                         .EnableInstanceEndpoint()
@@ -94,9 +111,15 @@ namespace JobService.Service
                     });
                 });
             });
+            
             services.AddMassTransitHostedService();
 
             services.AddOpenApiDocument(cfg => cfg.PostProcess = d => d.Info.Title = "Convert Video Service");
+        }
+        
+        public static void ConfigureSessionIdFormatter<T>( IServiceBusMessageSendTopologyConfigurator<T> cfg ) where T : class
+        {
+            cfg.UseSessionIdFormatter(x => Guid.NewGuid().ToString());
         }
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
@@ -120,7 +143,8 @@ namespace JobService.Service
                     ResponseWriter = HealthCheckResponseWriter
                 });
 
-                endpoints.MapHealthChecks("/health/live", new HealthCheckOptions {ResponseWriter = HealthCheckResponseWriter});
+                endpoints.MapHealthChecks("/health/live",
+                    new HealthCheckOptions {ResponseWriter = HealthCheckResponseWriter});
 
                 endpoints.MapControllers();
             });
@@ -131,10 +155,11 @@ namespace JobService.Service
         {
             var json = new JObject(
                 new JProperty("status", result.Status.ToString()),
-                new JProperty("results", new JObject(result.Entries.Select(entry => new JProperty(entry.Key, new JObject(
-                    new JProperty("status", entry.Value.Status.ToString()),
-                    new JProperty("description", entry.Value.Description),
-                    new JProperty("data", JObject.FromObject(entry.Value.Data))))))));
+                new JProperty("results", new JObject(result.Entries.Select(entry => new JProperty(entry.Key,
+                    new JObject(
+                        new JProperty("status", entry.Value.Status.ToString()),
+                        new JProperty("description", entry.Value.Description),
+                        new JProperty("data", JObject.FromObject(entry.Value.Data))))))));
 
             context.Response.ContentType = "application/json";
 
